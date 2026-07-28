@@ -1,0 +1,12 @@
+[Unit]
+Description=VK TURN Proxy (r6, WireGuard backend :51820)
+After=network.target wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+[Service]
+Type=simple
+ExecStart=/opt/turnproxy/server-r6 -listen 0.0.0.0:56000 -udp-connect 127.0.0.1:51820 -tui off
+Restart=always
+RestartSec=3
+User=root
+[Install]
+WantedBy=multi-user.target

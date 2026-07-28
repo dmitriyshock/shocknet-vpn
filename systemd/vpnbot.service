@@ -1,0 +1,14 @@
+[Unit]
+Description=VPN Telegram Bot
+After=network.target xray.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vpnbot
+ExecStart=/opt/vpnserver/venv/bin/python /opt/vpnbot/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

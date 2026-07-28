@@ -1,0 +1,12 @@
+.env
+config.json
+credentials.env
+users.json
+stats_persistent.json
+.state
+*.pyc
+__pycache__/
+*.db
+*.db-*
+*.log
+*.bak

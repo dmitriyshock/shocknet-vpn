@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN Subscription Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/vpnserver/venv/bin/python /opt/subserver/server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

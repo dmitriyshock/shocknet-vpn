@@ -1,0 +1,3 @@
+{
+  "_comment": "This file intentionally contains no credentials or users. setup.sh generates /opt/xray/config.json with fresh Reality keys and an initial administrator profile."
+}

@@ -1,0 +1,4 @@
+python-dotenv
+python-telegram-bot
+qrcode[pil]
+PyYAML

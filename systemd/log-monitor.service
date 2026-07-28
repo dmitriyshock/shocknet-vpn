@@ -1,0 +1,13 @@
+[Unit]
+Description=Nginx Visitor Log Monitor
+After=network.target nginx.service
+
+[Service]
+Type=simple
+ExecStart=/opt/vpnserver/venv/bin/python /opt/log-monitor/monitor.py
+WorkingDirectory=/opt/log-monitor
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

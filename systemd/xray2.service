@@ -1,0 +1,14 @@
+[Unit]
+Description=Xray2 (standalone VLESS+Reality+Vision, port 8443)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/xray2/xray run -config /opt/xray2/config.json
+Restart=on-failure
+RestartSec=3
+User=root
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
