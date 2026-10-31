@@ -95,6 +95,28 @@ class SubscriptionTests(unittest.TestCase):
                                                    "email": "tg_1", "label": "A"}))
         self.assertNotIn('href="#"', web.landing_page())
 
+    def test_no_traffic_quota_or_remaining_balance_display(self):
+        pages = (web.landing_page(), web.admin_page(),
+                 web.user_page({"token": "abc", "uuid": web.UUID,
+                                "email": "tg_1", "label": "A"}), web.JS)
+        for page in pages:
+            self.assertNotIn("3 ТБ", page)
+            self.assertNotIn("Осталось:", page)
+            self.assertNotIn("const LIMIT", page)
+        self.assertIn("if(document.getElementById('all-users'))", web.JS)
+
+    def test_inline_javascript_is_valid(self):
+        for page in (web.landing_page(), web.admin_page(),
+                     web.user_page({"token": "abc", "uuid": web.UUID,
+                                    "email": "tg_1", "label": "A"})):
+            scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", page, re.S)
+            for code in scripts:
+                if not code.strip():
+                    continue
+                result = subprocess.run(["node", "--check", "-"], input=code,
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_legacy_traffic_aliases_generalized(self):
         result = web._merge_aliases({"tg_123_ws": {"uplink": 1, "downlink": 2},
                                      "tg_456_8443": {"uplink": 3, "downlink": 4}})
@@ -337,6 +359,7 @@ class HttpSmokeTests(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertIn(b"ShockNet VPN", r.read())
         with urlopen(self.url("/sub/user-token"), timeout=5) as r:
+            self.assertEqual(r.headers.get("subscription-userinfo"), "upload=0; download=0; total=0")
             links = base64.b64decode(r.read()).decode()
             self.assertIn(":8443?", links)
         browser = Request(self.url("/sub/user-token"), headers={"User-Agent": "Mozilla/5.0"})
@@ -344,7 +367,9 @@ class HttpSmokeTests(unittest.TestCase):
             page = r.read().decode()
             self.assertIn("&lt;b&gt;danger&lt;/b&gt;", page)
         with urlopen(self.url("/api/user-stats/user-token"), timeout=5) as r:
-            self.assertIn("uplink", json.loads(r.read()))
+            stats = json.loads(r.read())
+            self.assertIn("uplink", stats)
+            self.assertNotIn("limit", stats)
         with urlopen(self.url("/admin"), timeout=5) as r:
             self.assertTrue(r.geturl().endswith("/login"))
 

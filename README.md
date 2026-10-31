@@ -55,8 +55,6 @@ The web panel is available at `https://YOUR_DOMAIN`; the Telegram login-protecte
 
 The web service listens on `127.0.0.1:8008`; Nginx is the public entrypoint. Trial keys expire after seven days and a bot job revokes their Xray credentials every minute (as long as the bot runs). Users should not rely on subscription URLs as secure storage: anyone possessing a URL can import that profile until access is revoked.
 
-The displayed **3 TB** is an informational comparison against lifetime traffic counters, **not** a monthly quota and **not** an enforced limit. Enforcing traffic limits or billing cycles requires additional server-side logic.
-
 Optional download links (`HAPP_DOWNLOAD_*`, `CLASH_DOWNLOAD_*`) can be configured in `/opt/vpnserver/.env` with official HTTPS URLs; until then, the panel deliberately shows no dead download buttons. The network metrics interface is auto-detected from the default route, or can be overridden with `METRICS_IFACE`.
 
 The optional `turnproxy.service` unit is provided as an integration point for an existing binary and WireGuard installation. This installer does **not** install that separate component; the dashboard shows it as unavailable when not installed.

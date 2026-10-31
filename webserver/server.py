@@ -23,7 +23,6 @@ WEB_PORT    = 8008
 XRAY_API    = "127.0.0.1:10085"
 XRAY_API2   = "127.0.0.1:10086"
 USERS_FILE  = "/opt/vpnbot/users.json"
-TOTAL_LIMIT = 3 * 1024 ** 4
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME   = os.getenv("BOT_USERNAME", "myvpngift_bot")
@@ -733,18 +732,17 @@ function fmt(b){b=parseInt(b)||0;
   if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';
   if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
 function renderStats(data){
-  const LIMIT=3*1024*1024*1024*1024;
-  let tot=0;
-  (data.users||[]).forEach(u=>{tot+=(parseInt(u.uplink)||0)+(parseInt(u.downlink)||0)});
-  const pct=Math.min(100,tot/LIMIT*100),pctS=pct.toFixed(1);
-  const col=pct>85?'#f87171':pct>60?'#fb923c':'#34d399';
+  let totalUp=0,totalDown=0;
+  (data.users||[]).forEach(u=>{
+    totalUp+=(parseInt(u.uplink)||0);
+    totalDown+=(parseInt(u.downlink)||0);
+  });
   const srv=document.getElementById('srv-stats');
   if(srv) srv.innerHTML=`
-    <div class="trow"><span class="tlabel">Всего на сервере (3 ТБ)</span>
-      <span class="tval"><b style="color:var(--t)">${fmt(tot)}</b> <span style="color:var(--m)">из 3 ТБ</span></span></div>
-    <div class="track"><div class="fill" style="width:${pctS}%;background:${col}"></div></div>
-    <div class="tmeta"><span style="color:${col}">${pctS}% использовано</span>
-      <span style="color:var(--m)">Осталось: ${fmt(LIMIT-tot)}</span></div>`;
+    <div class="trow"><span class="tlabel">Всего на сервере</span>
+      <span class="tval"><b style="color:var(--t)">${fmt(totalUp+totalDown)}</b></span></div>
+    <div class="tmeta"><span>↑ Отправлено: ${fmt(totalUp)}</span>
+      <span>↓ Получено: ${fmt(totalDown)}</span></div>`;
   // personal
   const uid=document.getElementById('user-email')?.value;
   if(uid){
@@ -752,14 +750,12 @@ function renderStats(data){
     const el=document.getElementById('user-stats');
     if(el&&u){
       const up=parseInt(u.uplink)||0,dn=parseInt(u.downlink)||0,t=up+dn;
-      const up2=Math.min(100,t/LIMIT*100),uc=up2>85?'#f87171':up2>60?'#fb923c':'#34d399';
       el.innerHTML=`
         <div class="trow"><span class="tlabel">Твой расход</span>
-          <span class="tval"><b style="color:var(--t)">${fmt(t)}</b> <span style="color:var(--m)">из 3 ТБ</span></span></div>
-        <div class="track"><div class="fill" style="width:${up2.toFixed(1)}%;background:${uc}"></div></div>
+          <span class="tval"><b style="color:var(--t)">${fmt(t)}</b></span></div>
         <div class="tmeta">
-          <span>↑ <b style="color:#34d399">${fmt(up)}</b> &nbsp; ↓ <b style="color:#60a5fa">${fmt(dn)}</b></span>
-          <span style="color:var(--m)">${up2.toFixed(1)}%</span></div>`;
+          <span>↑ <b style="color:#34d399">${fmt(up)}</b></span>
+          <span>↓ <b style="color:#60a5fa">${fmt(dn)}</b></span></div>`;
     }
   }
   // admin table
@@ -809,7 +805,7 @@ function flash(id,btn){
   setTimeout(()=>{document.getElementById(id)?.classList.remove('flash');
     btn.textContent=o;btn.classList.remove('ok');},2000);
 }
-loadStats();setInterval(loadStats,30000);
+if(document.getElementById('all-users')){loadStats();setInterval(loadStats,30000);}
 
 function loadSystem(){
   fetch('/api/system',{credentials:'same-origin'}).then(jsonOrLogin).then(d=>{
@@ -972,7 +968,6 @@ footer{{border-top:1px solid var(--br);padding:24px 20px;text-align:center;
 <div style="max-width:560px;margin:0 auto 60px;padding:0 20px">
   <div class="strip">
     <div class="si"><div class="sv">VLESS</div><div class="sl">Протокол</div></div>
-    <div class="si"><div class="sv">3 ТБ</div><div class="sl">Ориентир трафика</div></div>
     <div class="si"><div class="sv">443</div><div class="sl">Порт</div></div>
   </div>
 </div>
@@ -1177,30 +1172,21 @@ def user_page(user: dict) -> str:
   const TOKEN="{token}";
   loadStats=function(){{
     fetch('/api/user-stats/'+TOKEN).then(r=>r.json()).then(function(d){{
-      const LIMIT=d.limit||3*1024*1024*1024*1024;
       const up=parseInt(d.uplink)||0,dn=parseInt(d.downlink)||0,t=up+dn;
       const tot=parseInt(d.total_server)||0;
       // user block
       const el=document.getElementById('user-stats');
       if(el){{
-        const pct=Math.min(100,t/LIMIT*100);
-        const col=pct>85?'#f87171':pct>60?'#fb923c':'#34d399';
         el.innerHTML=`<div class="trow"><span class="tlabel">Твой расход</span>
-          <span class="tval"><b style="color:var(--t)">${{fmt(t)}}</b> <span style="color:var(--m)">из 3 ТБ</span></span></div>
-          <div class="track"><div class="fill" style="width:${{pct.toFixed(1)}}%;background:${{col}}"></div></div>
-          <div class="tmeta"><span>↑ <b style="color:#34d399">${{fmt(up)}}</b> &nbsp; ↓ <b style="color:#60a5fa">${{fmt(dn)}}</b></span>
-          <span style="color:var(--m)">${{pct.toFixed(1)}}%</span></div>`;
+          <span class="tval"><b style="color:var(--t)">${{fmt(t)}}</b></span></div>
+          <div class="tmeta"><span>↑ Отправлено: <b style="color:#34d399">${{fmt(up)}}</b></span>
+          <span>↓ Получено: <b style="color:#60a5fa">${{fmt(dn)}}</b></span></div>`;
       }}
       // server block
       const srv=document.getElementById('srv-stats');
       if(srv){{
-        const p2=Math.min(100,tot/LIMIT*100);
-        const c2=p2>85?'#f87171':p2>60?'#fb923c':'#34d399';
         srv.innerHTML=`<div class="trow"><span class="tlabel">Всего на сервере</span>
-          <span class="tval"><b style="color:var(--t)">${{fmt(tot)}}</b> <span style="color:var(--m)">из 3 ТБ</span></span></div>
-          <div class="track"><div class="fill" style="width:${{p2.toFixed(1)}}%;background:${{c2}}"></div></div>
-          <div class="tmeta"><span style="color:${{c2}}">${{p2.toFixed(1)}}% использовано</span>
-          <span style="color:var(--m)">Осталось: ${{fmt(LIMIT-tot)}}</span></div>`;
+          <span class="tval"><b style="color:var(--t)">${{fmt(tot)}}</b></span></div>`;
       }}
       document.getElementById('last-upd').textContent='Обновлено: '+new Date().toLocaleTimeString('ru-RU');
     }}).catch(()=>{{}});
@@ -1323,7 +1309,7 @@ def admin_page() -> str:
     <div class="card-head">
       <div class="icon icon-stat">📊</div>
       <div><div class="card-title">Трафик пользователей</div>
-        <div class="card-sub">Трафик за всё время · 3 ТБ — ориентир, не квота · включая отозванных</div></div>
+        <div class="card-sub">Трафик за всё время · включая отозванных</div></div>
       <button class="rbtn" style="margin-left:auto" onclick="loadStats()">↻</button>
     </div>
     <div class="tblock" id="srv-stats"><div style="color:var(--m);font-size:.85rem">Загрузка...</div></div>
@@ -1523,7 +1509,7 @@ class Handler(BaseHTTPRequestHandler):
         filename = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)[:100]
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("subscription-userinfo",
-                         f"upload=0; download={ul+dl}; total={TOTAL_LIMIT}")
+                         f"upload=0; download={ul+dl}; total=0")
         self.send_header("profile-title",         f"base64:{title_b64}")
         self.send_header("profile-web-page-url",  page_url)
         self.send_header("profile-update-interval", "24")
@@ -1598,7 +1584,6 @@ class Handler(BaseHTTPRequestHandler):
                 "uplink":       ul,
                 "downlink":     dl,
                 "total_server": all_ul + all_dl,
-                "limit":        TOTAL_LIMIT,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
