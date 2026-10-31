@@ -81,11 +81,11 @@ python3 /opt/vpnserver/repo/scripts/add_microsoft_test_profiles.py --apply
 
 Для ручного теста можно клонировать уже работающие VLESS-профили на клиенте: профиль `4443` → порт `8450`, SNI `www.microsoft.com`; профиль `2053` → порт `8451`, SNI `www.microsoft.com`. Остальные параметры, включая публичный Reality-ключ и short ID, остаются как в соответствующем исходном профиле. Новые тестовые порты пока не публикуются автоматически во всех подписках.
 
-### Исправление сертификата `shocknet.ru` при TLS-маршрутизации
+### Диагностика ошибки HTTPS-сертификата
 
-Для VPS с отдельным Nginx `stream` на порту `443` и локальным HTTPS `127.0.0.1:9443` есть **необязательный** скрипт `scripts/fix_shocknet_ru_tls.py`. Используйте его только если прямое TLS-подключение к `9443` с SNI `shocknet.ru` проверяет сертификат успешно, а подключение через публичный `443` получает чужой сертификат. Скрипт переносит только HTTPS-виртуальный хост `shocknet.ru` на отдельный локальный порт `9444` и добавляет для него отдельный маршрут в `stream`. Маршрут Reality для `ok.ru` и остальные службы не меняются.
+На VPS с отдельным Nginx `stream` на публичном порту `443` нельзя добавлять глобальные NAT-правила вида `iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports 8443` или аналогичные правила в `PREROUTING`. Они перехватывают все исходящие HTTPS-соединения (включая GitHub) и обходят SNI-маршрутизацию Nginx для входящих подключений. Это может привести к тому, что `shocknet.ru` или внешний сайт получит сертификат `shocknet.online`, даже если оба Let's Encrypt-сертификата действительны.
 
-Скрипт по умолчанию делает только сухую проверку. При `--apply` проверяет свободный порт, создаёт резервные копии двух конфигураций Nginx, выполняет `nginx -t`, перезагружает Nginx и проверяет сертификаты обоих доменов через `443` с включённой проверкой TLS. При ошибке откатывает оба файла и повторно загружает исходную конфигурацию. Во время перезагрузки Nginx возможен короткий перерыв в HTTPS-подключениях. Скрипт намеренно не выпускает новые сертификаты и не изменяет файлы Let's Encrypt.
+При такой ошибке проверяйте `iptables -t nat -S OUTPUT`, `iptables -t nat -S PREROUTING` и `nft -a list ruleset`. Сначала сохраните резервную копию NAT-правил и определите их источник автозапуска. Исправлять нужно **только конкретное ошибочное правило**, сохраняя Docker, UFW и VPN-маршруты. Не отключайте проверку сертификата (`curl -k`) и не меняйте внутренние HTTPS-порты ради обхода глобального перенаправления.
 
 Visitor GeoIP lookup is disabled by default to protect visitor privacy. To opt in, provide `GEOIP_HTTPS_ENDPOINT` as an HTTPS URL containing `{ip}` and returning `status/country/regionName/city/lat/lon/isp` fields (compatible with the old `ip-api.com` JSON structure). Visitor IP addresses will be transmitted to that service. Subscription paths and user-stats URLs are excluded from new Nginx access logs; the log monitor also redacts them when parsing old logs.
 
