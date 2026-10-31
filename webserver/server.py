@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import base64, collections, hashlib, hmac, io, json, os, secrets, subprocess, threading, time, urllib.parse, urllib.request, yaml
+import base64, collections, fcntl, hashlib, hmac, html, io, json, os, re, secrets, subprocess, tempfile, threading, time, urllib.parse, urllib.request, yaml
+from contextlib import contextmanager
+from pathlib import Path
 import qrcode
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from dotenv import load_dotenv
@@ -25,39 +27,71 @@ TOTAL_LIMIT = 3 * 1024 ** 4
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME   = os.getenv("BOT_USERNAME", "myvpngift_bot")
+BOT_URL        = "https://t.me/" + urllib.parse.quote(BOT_USERNAME, safe="")
 SESSION_SECRET = os.getenv("SESSION_SECRET") or secrets.token_hex(32)
 
 STATIC_USER = {
-    "email": os.getenv("STATIC_TOKEN", "user1"),
+    "email": "admin",
     "label": os.getenv("STATIC_LABEL", "Администратор"),
-    "token": os.getenv("STATIC_TOKEN", "user1"),
+    "token": os.getenv("STATIC_TOKEN", ""),
     "uuid":  UUID,
     "username": os.getenv("ADMIN_USERNAME", ""),
     "approved": True,
 }
 
-DL_CLASH = {"win": "#", "mac": "#", "linux": "#"}
-DL_HAPP  = {"android": "#", "ios": "#"}
+DL_CLASH = {"win": os.getenv("CLASH_DOWNLOAD_WINDOWS", ""),
+            "mac": os.getenv("CLASH_DOWNLOAD_MACOS", ""),
+            "linux": os.getenv("CLASH_DOWNLOAD_LINUX", "")}
+DL_HAPP  = {"android": os.getenv("HAPP_DOWNLOAD_ANDROID", ""),
+            "ios": os.getenv("HAPP_DOWNLOAD_IOS", "")}
+
+def download_links(client: str) -> str:
+    options = (
+        [("🤖 Android", DL_HAPP["android"]), ("🍎 iOS", DL_HAPP["ios"])]
+        if client == "happ" else
+        [("🪟 Windows", DL_CLASH["win"]), ("🍎 macOS", DL_CLASH["mac"]),
+         ("🐧 Linux", DL_CLASH["linux"])]
+    )
+    links = [f'<a class="dlbtn" href="{html.escape(url, quote=True)}" '
+             f'rel="noopener noreferrer" target="_blank">{label}</a>'
+             for label, url in options if url.startswith("https://")]
+    if not links:
+        return '<div class="dllabel">Скачай клиент из его официального магазина или сайта</div>'
+    return '<div class="dllabel">Скачать</div><div class="dlrow">' + ''.join(links) + '</div>'
 
 # ── auth ──────────────────────────────────────────────────────────────────────
-def make_session_token():
-    return hmac.new(SESSION_SECRET.encode(), b"admin", hashlib.sha256).hexdigest()
+SESSION_TTL_SECONDS = 7 * 86400
 
-SESSION_TOKEN = make_session_token()
+def make_session_token(issued_at=None):
+    issued_at = int(time.time()) if issued_at is None else int(issued_at)
+    payload = str(issued_at)
+    signature = hmac.new(SESSION_SECRET.encode(), f"admin:{payload}".encode(), hashlib.sha256).hexdigest()
+    return payload + "." + signature
 
 def is_authenticated(cookie_header: str) -> bool:
     if not cookie_header:
         return False
     for part in cookie_header.split(";"):
         k, _, v = part.strip().partition("=")
-        if k.strip() == "session" and v.strip() == SESSION_TOKEN:
-            return True
+        if k.strip() == "session":
+            token = v.strip()
+            stamp, separator, signature = token.partition(".")
+            if not separator or not stamp.isascii() or not stamp.isdigit():
+                return False
+            age = time.time() - int(stamp)
+            if age < 0 or age > SESSION_TTL_SECONDS:
+                return False
+            expected = make_session_token(int(stamp))
+            return hmac.compare_digest(expected, token)
     return False
 
 def verify_telegram_auth(data: dict) -> bool:
     """Проверяем подпись от Telegram Login Widget."""
     check_hash = data.get("hash", "")
-    auth_date  = int(data.get("auth_date", 0))
+    try:
+        auth_date = int(data.get("auth_date", 0))
+    except (ValueError, TypeError):
+        return False
     # Подпись не старше 24 часов
     if abs(time.time() - auth_date) > 86400:
         return False
@@ -103,7 +137,8 @@ h2{{font-size:1.5rem;font-weight:700;margin-bottom:6px;
 # ── users ─────────────────────────────────────────────────────────────────────
 def load_db() -> dict:
     try:
-        return json.loads(open(USERS_FILE).read())
+        with open(USERS_FILE, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return {"admin_id": 0, "users": {}}
 
@@ -152,7 +187,7 @@ def all_users_for_stats() -> list:
 
 def find_user(token: str):
     import time
-    if token == STATIC_USER["token"]:
+    if STATIC_USER["token"] and token == STATIC_USER["token"]:
         return STATIC_USER
     for u in active_users():
         if u["token"] == token:
@@ -172,16 +207,40 @@ def find_user(token: str):
 
 # ── xray stats (persistent across restarts) ───────────────────────────────────
 STATS_FILE = "/opt/vpnbot/stats_persistent.json"
+STATS_LOCK_FILE = "/opt/vpnbot/stats_persistent.lock"
+
+@contextmanager
+def stats_file_lock(exclusive=False):
+    lock_path = Path(STATS_LOCK_FILE)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 def _load_persistent() -> dict:
     try:
-        return json.loads(open(STATS_FILE).read())
+        with open(STATS_FILE, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return {}
 
 def _save_persistent(data: dict):
     try:
-        open(STATS_FILE, "w").write(json.dumps(data))
+        target = Path(STATS_FILE)
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent,
+                                             prefix=".stats-", delete=False) as f:
+                tmp_name = f.name
+                os.fchmod(f.fileno(), 0o600)
+                json.dump(data, f)
+            os.replace(tmp_name, target)
+        finally:
+            if tmp_name and os.path.exists(tmp_name):
+                os.unlink(tmp_name)
     except Exception:
         pass
 
@@ -213,26 +272,23 @@ def _query_live2() -> dict:
 
 def snapshot_stats():
     """Считываем счётчики с --reset (дельта с прошлого snapshot) и прибавляем к persistent."""
-    delta = _merge_aliases(_query_xray(reset=True, api=XRAY_API))
-    delta2 = _merge_aliases(_query_xray(reset=True, api=XRAY_API2, binary="/opt/xray2/xray"))
-    saved = _merge_aliases(_load_persistent())
-    for email, vals in delta.items():
-        if email not in saved:
-            saved[email] = {"uplink": 0, "downlink": 0}
-        saved[email]["uplink"]   += vals.get("uplink", 0)
-        saved[email]["downlink"] += vals.get("downlink", 0)
-    for email, vals in delta2.items():
-        if email not in saved:
-            saved[email] = {"uplink": 0, "downlink": 0}
-        saved[email]["uplink"]   += vals.get("uplink", 0)
-        saved[email]["downlink"] += vals.get("downlink", 0)
-    _save_persistent(saved)
+    with stats_file_lock(exclusive=True):
+        delta = _merge_aliases(_query_xray(reset=True, api=XRAY_API))
+        delta2 = _merge_aliases(_query_xray(reset=True, api=XRAY_API2, binary="/opt/xray2/xray"))
+        saved = _merge_aliases(_load_persistent())
+        for source in (delta, delta2):
+            for email, vals in source.items():
+                saved.setdefault(email, {"uplink": 0, "downlink": 0})
+                saved[email]["uplink"] += vals.get("uplink", 0)
+                saved[email]["downlink"] += vals.get("downlink", 0)
+        _save_persistent(saved)
 
 def get_stats() -> dict:
     """persistent (всё до последнего snapshot) + live (с момента последнего snapshot)."""
-    saved = _merge_aliases(_load_persistent())
-    live  = _merge_aliases(_query_live())
-    live2 = _merge_aliases(_query_live2())
+    with stats_file_lock():
+        saved = _merge_aliases(_load_persistent())
+        live  = _merge_aliases(_query_live())
+        live2 = _merge_aliases(_query_live2())
     out   = {}
     for email in set(saved) | set(live) | set(live2):
         s = saved.get(email, {})
@@ -257,21 +313,20 @@ EMAIL_ALIASES = {
     "user1_admin_happ": "user1_happ",
     "user1_ws":         "user1",
     "user1_admin_ws":   "user1",
-    "tg_8677536826_ws": "tg_8677536826",
-    "tg_1483599707_ws": "tg_1483599707",
     "user1_8443":          "user1",
     "user1_admin_8443":    "user1",
-    "tg_8677536826_8443":  "tg_8677536826",
     "user1_happ_8443":     "user1_happ",
     "user1_admin_happ_8443": "user1_happ",
-    "tg_8677536826_happ_8443": "tg_8677536826_happ",
-    "tg_1483599707_happ_8443": "tg_1483599707_happ",
 }
 
 def _merge_aliases(d: dict) -> dict:
     out = {}
     for email, vals in d.items():
         key = EMAIL_ALIASES.get(email, email)
+        for suffix in ("_ws", "_8443", "_8444", "_8445", "_8446"):
+            if key.endswith(suffix):
+                key = key[:-len(suffix)]
+                break
         if key not in out:
             out[key] = {"uplink": 0, "downlink": 0}
         out[key]["uplink"]   += vals.get("uplink", 0)
@@ -286,7 +341,7 @@ def _autosave_stats():
     threading.Thread(target=loop, daemon=True).start()
 
 # ── system metrics ────────────────────────────────────────────────────────────
-METRICS_IFACE   = "ens1"
+METRICS_IFACE   = os.getenv("METRICS_IFACE", "")
 METRICS_MAXLEN  = 720   # 1 час при интервале 5 сек
 METRICS_INTERVAL = 5
 metrics_buf  = collections.deque(maxlen=METRICS_MAXLEN)
@@ -303,11 +358,22 @@ def _read_cpu():
     return total, idle
 
 def _read_net():
+    iface = METRICS_IFACE
+    if not iface:
+        try:
+            with open("/proc/net/route") as f:
+                iface = next((parts[0] for line in f for parts in [line.split()]
+                              if len(parts) > 1 and parts[1] == "00000000"), "")
+        except OSError:
+            pass
     with open("/proc/net/dev") as f:
         for line in f:
-            if METRICS_IFACE + ":" in line:
-                parts = line.split()
-                return int(parts[1]), int(parts[9])  # rx_bytes, tx_bytes
+            if ":" not in line:
+                continue
+            name, counters = line.split(":", 1)
+            if name.strip() == iface:
+                parts = counters.split()
+                return int(parts[0]), int(parts[8])  # rx_bytes, tx_bytes
     return 0, 0
 
 def _read_ram():
@@ -429,9 +495,12 @@ def ws_link(uid=None, name=None):
     return f"vless://{uid}@{DOMAIN}:{PORT_WS}?{p}#{urllib.parse.quote(label)}"
 
 def v2ray_sub(uid=None):
-    # Reality-профили на разных whitelisted SNI — выбираешь в HAPP какой работает лучше
-    links = [vless_link(uid, flow=False, port=port, name=REMARK + " · " + label, sni=sni)
-             for port, sni, label in SNI_PROFILES]
+    links = [vless_link(uid, name=REMARK + " · Основной"),
+             vless_link(uid, flow=False, port=PORT_HAPP, name=REMARK + " · Mobile"),
+             ws_link(uid)]
+    links.extend(vless_link(uid, flow=True, port=port,
+                            name=REMARK + " · " + label, sni=sni)
+                 for port, sni, label in SNI_PROFILES)
     combined = "\n".join(links)
     return base64.b64encode(combined.encode()).decode()
 
@@ -459,17 +528,40 @@ RU_DOMAINS = [
 
 def clash_yaml(uid=None):
     uid = uid or UUID
-    # Reality-профили на разных whitelisted SNI
-    proxies_list = [{
+    # Match the actual Xray client flow: Vision on 4443 and 8443-8446,
+    # no flow on the mobile 2053 endpoint.
+    reality_proxies = [{
         "name": REMARK + " · " + label,
         "type": "vless",
         "server": SERVER_IP, "port": port, "uuid": uid,
         "network": "tcp", "tls": True, "udp": True,
         "packet-encoding": "xudp",
+        "flow": "xtls-rprx-vision",
         "reality-opts": {"public-key": PUBLIC_KEY, "short-id": SHORT_ID},
         "servername": sni, "client-fingerprint": "chrome",
     } for port, sni, label in SNI_PROFILES]
-    proxy_names = [REMARK + " · " + label for _, _, label in SNI_PROFILES]
+    proxies_list = [{
+        "name": REMARK + " · Основной", "type": "vless",
+        "server": SERVER_IP, "port": PORT_VLESS, "uuid": uid,
+        "network": "tcp", "tls": True, "udp": True,
+        "flow": "xtls-rprx-vision", "packet-encoding": "xudp",
+        "reality-opts": {"public-key": PUBLIC_KEY, "short-id": SHORT_ID},
+        "servername": SNI, "client-fingerprint": "chrome",
+    }, {
+        "name": REMARK + " · Mobile", "type": "vless",
+        "server": SERVER_IP, "port": PORT_HAPP, "uuid": uid,
+        "network": "tcp", "tls": True, "udp": True,
+        "packet-encoding": "xudp",
+        "reality-opts": {"public-key": PUBLIC_KEY, "short-id": SHORT_ID},
+        "servername": SNI, "client-fingerprint": "chrome",
+    }, {
+        "name": REMARK + " · WiFi", "type": "vless",
+        "server": DOMAIN, "port": PORT_WS, "uuid": uid,
+        "network": "ws", "ws-opts": {"path": "/vless"},
+        "tls": True, "servername": DOMAIN, "udp": True,
+        "client-fingerprint": "chrome",
+    }] + reality_proxies
+    proxy_names = [p["name"] for p in proxies_list]
     GRP = "ShockNet"
     rules = (
         [f"IP-CIDR,{SERVER_IP}/32,DIRECT,no-resolve",
@@ -485,7 +577,7 @@ def clash_yaml(uid=None):
         + [f"MATCH,{GRP}"]
     )
     return yaml.dump({
-        "mixed-port": 7890, "allow-lan": True,
+        "mixed-port": 7890, "allow-lan": False,
         "mode": "rule", "log-level": "info",
         "external-controller": "127.0.0.1:9090",
         "geodata-mode": True,
@@ -674,12 +766,12 @@ function renderStats(data){
   const tbl=document.getElementById('all-users');
   if(tbl&&data.users) tbl.innerHTML=data.users.map(u=>{
     const up=parseInt(u.uplink)||0,dn=parseInt(u.downlink)||0,tot2=up+dn;
-    const init=(u.label||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+     const init=(u.label||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
     const revBadge=u.approved?'':'<span class="urev">отозван</span>';
     return `<div class="urow">
-      <div class="avatar${u.approved?'':' rev'}">${init}</div>
-      <div class="uinfo"><div class="uname">${u.label}${revBadge}</div>
-        <div class="uemail">${u.email}</div></div>
+       <div class="avatar${u.approved?'':' rev'}">${escapeHtml(init)}</div>
+       <div class="uinfo"><div class="uname">${escapeHtml(u.label)}${revBadge}</div>
+         <div class="uemail">${escapeHtml(u.email)}</div></div>
       <div class="tstats">
         <div class="si"><div class="sv up">↑ ${fmt(up)}</div><div class="sl">Отправлено</div></div>
         <div class="si"><div class="sv dn">↓ ${fmt(dn)}</div><div class="sl">Получено</div></div>
@@ -687,6 +779,10 @@ function renderStats(data){
       </div></div>`;
   }).join('');
   document.getElementById('last-upd').textContent='Обновлено: '+new Date().toLocaleTimeString('ru-RU');
+}
+function escapeHtml(value){
+  return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
+    '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function jsonOrLogin(r){
   if(r.redirected || r.status===401 || r.status===302){location.href='/login';throw new Error('auth');}
@@ -727,11 +823,13 @@ function loadSystem(){
       document.getElementById('bot-stop').disabled=!d.bot;
     }
     if(ts){
-      ts.innerHTML=d.turn
-        ? '<span class="st-dot st-on"></span> Работает'
-        : '<span class="st-dot st-off"></span> Остановлен';
-      document.getElementById('turn-start').disabled=d.turn;
-      document.getElementById('turn-stop').disabled=!d.turn;
+      ts.innerHTML=!d.turn_installed
+        ? '<span class="st-dot st-unknown"></span> Не установлен'
+        : d.turn
+          ? '<span class="st-dot st-on"></span> Работает'
+          : '<span class="st-dot st-off"></span> Остановлен';
+      document.getElementById('turn-start').disabled=!d.turn_installed||d.turn;
+      document.getElementById('turn-stop').disabled=!d.turn_installed||!d.turn;
     }
   }).catch(e=>{
     if(e&&e.message==='auth')return;
@@ -866,7 +964,7 @@ footer{{border-top:1px solid var(--br);padding:24px 20px;text-align:center;
   <h1>ShockNet VPN</h1>
   <p class="hero-sub">Быстрый и надёжный VPN без ограничений.<br>Работает на любом WiFi и мобильном интернете.</p>
   <div class="hero-btns">
-    <a href="https://t.me/myvpngift_bot" class="btn-main">📱 Получить доступ</a>
+    <a href="{BOT_URL}" class="btn-main">📱 Получить доступ</a>
     <a href="#how" class="btn-ghost">Как подключиться?</a>
   </div>
 </div>
@@ -874,7 +972,7 @@ footer{{border-top:1px solid var(--br);padding:24px 20px;text-align:center;
 <div style="max-width:560px;margin:0 auto 60px;padding:0 20px">
   <div class="strip">
     <div class="si"><div class="sv">VLESS</div><div class="sl">Протокол</div></div>
-    <div class="si"><div class="sv">3 ТБ</div><div class="sl">В месяц</div></div>
+    <div class="si"><div class="sv">3 ТБ</div><div class="sl">Ориентир трафика</div></div>
     <div class="si"><div class="sv">443</div><div class="sl">Порт</div></div>
   </div>
 </div>
@@ -887,7 +985,7 @@ footer{{border-top:1px solid var(--br);padding:24px 20px;text-align:center;
       <div class="step-num">1</div>
       <div class="step-body">
         <div class="step-title">Запроси доступ в боте</div>
-        <div class="step-desc">Напиши <a href="https://t.me/myvpngift_bot">@myvpngift_bot</a> команду /start и нажми кнопку запроса доступа. Администратор одобрит в течение нескольких минут.</div>
+        <div class="step-desc">Напиши <a href="{BOT_URL}">@{html.escape(BOT_USERNAME)}</a> команду /start и нажми кнопку запроса доступа. Ожидай решения администратора.</div>
       </div>
     </div>
     <div class="step">
@@ -911,26 +1009,26 @@ footer{{border-top:1px solid var(--br);padding:24px 20px;text-align:center;
   <div class="section-title">Приложения</div>
   <div class="section-sub">Выбери под своё устройство</div>
   <div class="apps">
-    <a href="#" class="app-card">
+    <div class="app-card">
       <div class="app-icon">🤖</div>
       <div class="app-name">HAPP</div>
       <div class="app-desc">Android</div>
-    </a>
-    <a href="#" class="app-card">
+    </div>
+    <div class="app-card">
       <div class="app-icon">🍎</div>
       <div class="app-name">HAPP</div>
       <div class="app-desc">iOS / iPhone</div>
-    </a>
-    <a href="#" class="app-card">
+    </div>
+    <div class="app-card">
       <div class="app-icon">🪟</div>
       <div class="app-name">Koala Clash</div>
       <div class="app-desc">Windows</div>
-    </a>
-    <a href="#" class="app-card">
+    </div>
+    <div class="app-card">
       <div class="app-icon">🍏</div>
       <div class="app-name">Koala Clash</div>
       <div class="app-desc">macOS</div>
-    </a>
+    </div>
   </div>
 </div>
 
@@ -965,7 +1063,7 @@ footer{{border-top:1px solid var(--br);padding:24px 20px;text-align:center;
   <div class="tg-block">
     <h3>Готов подключиться?</h3>
     <p>Запроси доступ через Telegram бот — это займёт меньше минуты</p>
-    <a href="https://t.me/myvpngift_bot" class="tg-btn">
+    <a href="{BOT_URL}" class="tg-btn">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.012 9.482c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12L7.48 14.617l-2.95-.924c-.64-.203-.654-.64.136-.948l11.532-4.448c.533-.194 1 .13.826.95h-.001l-.462.001z"/></svg>
       Написать боту
     </a>
@@ -987,7 +1085,7 @@ def user_page(user: dict) -> str:
     token = user["token"]
     uid   = user["uuid"]
     email = user["email"]
-    label = user["label"]
+    label = html.escape(str(user["label"]), quote=True)
     sub_url = f"https://{DOMAIN}/sub/{token}"
     return f"""<!DOCTYPE html>
 <html lang="ru"><head>
@@ -1043,11 +1141,7 @@ def user_page(user: dict) -> str:
         </div>
       </div>
     </div>
-    <div class="dllabel">Скачать HAPP</div>
-    <div class="dlrow">
-      <a class="dlbtn" href="{DL_HAPP['android']}" target="_blank">🤖 Android</a>
-      <a class="dlbtn" href="{DL_HAPP['ios']}" target="_blank">🍎 iOS</a>
-    </div>
+    {download_links("happ")}
   </div>
 
   <div class="card">
@@ -1073,12 +1167,7 @@ def user_page(user: dict) -> str:
         </div>
       </div>
     </div>
-    <div class="dllabel">Скачать Koala Clash</div>
-    <div class="dlrow">
-      <a class="dlbtn" href="{DL_CLASH['win']}" target="_blank">🪟 Windows</a>
-      <a class="dlbtn" href="{DL_CLASH['mac']}" target="_blank">🍎 macOS</a>
-      <a class="dlbtn" href="{DL_CLASH['linux']}" target="_blank">🐧 Linux</a>
-    </div>
+    {download_links("clash")}
   </div>
 
 </div>
@@ -1123,6 +1212,7 @@ def user_page(user: dict) -> str:
 
 # ── admin page ────────────────────────────────────────────────────────────────
 def admin_page() -> str:
+    admin_token = urllib.parse.quote(STATIC_USER["token"], safe="")
     return f"""<!DOCTYPE html>
 <html lang="ru"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1233,7 +1323,7 @@ def admin_page() -> str:
     <div class="card-head">
       <div class="icon icon-stat">📊</div>
       <div><div class="card-title">Трафик пользователей</div>
-        <div class="card-sub">3 ТБ в месяц · включая отозванных</div></div>
+        <div class="card-sub">Трафик за всё время · 3 ТБ — ориентир, не квота · включая отозванных</div></div>
       <button class="rbtn" style="margin-left:auto" onclick="loadStats()">↻</button>
     </div>
     <div class="tblock" id="srv-stats"><div style="color:var(--m);font-size:.85rem">Загрузка...</div></div>
@@ -1251,8 +1341,8 @@ def admin_page() -> str:
       <div>
         <div class="flabel">Clash YAML</div>
         <div class="crow" id="r-clash">
-          <span class="cv">https://{DOMAIN}/sub/clash/user1</span>
-          <button class="cb" onclick="copy('r-clash','https://{DOMAIN}/sub/clash/user1',this)">Копировать</button>
+          <span class="cv">https://{DOMAIN}/sub/clash/{admin_token}</span>
+          <button class="cb" onclick="copy('r-clash',null,this)">Копировать</button>
         </div>
       </div>
       <hr class="divider">
@@ -1264,12 +1354,7 @@ def admin_page() -> str:
         </div>
       </div>
     </div>
-    <div class="dllabel">Скачать</div>
-    <div class="dlrow">
-      <a class="dlbtn" href="{DL_CLASH['win']}" target="_blank">🪟 Windows</a>
-      <a class="dlbtn" href="{DL_CLASH['mac']}" target="_blank">🍎 macOS</a>
-      <a class="dlbtn" href="{DL_CLASH['linux']}" target="_blank">🐧 Linux</a>
-    </div>
+    {download_links("clash")}
   </div>
 
   <div class="card">
@@ -1282,16 +1367,12 @@ def admin_page() -> str:
       <div>
         <div class="flabel">Ссылка подписки</div>
         <div class="crow" id="r-happ">
-          <span class="cv">https://{DOMAIN}/sub/user1</span>
-          <button class="cb" onclick="copy('r-happ','https://{DOMAIN}/sub/user1',this)">Копировать</button>
+          <span class="cv">https://{DOMAIN}/sub/{admin_token}</span>
+          <button class="cb" onclick="copy('r-happ',null,this)">Копировать</button>
         </div>
       </div>
     </div>
-    <div class="dllabel">Скачать</div>
-    <div class="dlrow">
-      <a class="dlbtn" href="{DL_HAPP['android']}" target="_blank">🤖 Android</a>
-      <a class="dlbtn" href="{DL_HAPP['ios']}" target="_blank">🍎 iOS</a>
-    </div>
+    {download_links("happ")}
   </div>
 </div>
 <script>{JS}</script>
@@ -1387,7 +1468,9 @@ def get_system_status() -> dict:
                          capture_output=True, text=True).stdout.strip()
     turn = subprocess.run(["systemctl", "is-active", "turnproxy"],
                           capture_output=True, text=True).stdout.strip()
-    return {"bot": bot == "active", "turn": turn == "active"}
+    available = subprocess.run(["systemctl", "show", "turnproxy", "--property=LoadState", "--value"],
+                               capture_output=True, text=True).stdout.strip()
+    return {"bot": bot == "active", "turn": turn == "active", "turn_installed": available == "loaded"}
 
 def turn_control(action: str) -> bool:
     cmd = "start" if action == "start" else "stop"
@@ -1437,6 +1520,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        filename = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)[:100]
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("subscription-userinfo",
                          f"upload=0; download={ul+dl}; total={TOTAL_LIMIT}")
@@ -1475,12 +1559,15 @@ class Handler(BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             data = {k: v[0] for k, v in qs.items()}
             db = load_db()
-            tg_id = int(data.get("id", 0))
+            try:
+                tg_id = int(data.get("id", 0))
+            except (ValueError, TypeError):
+                tg_id = 0
             if verify_telegram_auth(data) and tg_id == db.get("admin_id", 0):
                 self.send_response(302)
                 self.send_header("Location", "/admin")
                 self.send_header("Set-Cookie",
-                    f"session={SESSION_TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                    f"session={make_session_token()}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}")
                 self.end_headers()
             else:
                 self.html(LOGIN_HTML
@@ -1492,7 +1579,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/logout":
             self.send_response(302)
             self.send_header("Location", "/admin")
-            self.send_header("Set-Cookie", "session=; Max-Age=0; Path=/")
+            self.send_header("Set-Cookie", "session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict")
             self.end_headers()
             return
 
@@ -1611,6 +1698,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/") and not is_authenticated(self.cookies()):
             self.send_response(401); self.end_headers(); return
 
+        origin = self.headers.get("Origin")
+        fetch_site = self.headers.get("Sec-Fetch-Site")
+        if (origin and origin != f"https://{DOMAIN}") or (fetch_site and fetch_site not in ("same-origin", "none")):
+            self.send_response(403); self.end_headers(); return
+
         if self.path == "/api/bot/start":
             ok = bot_control("start")
             self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
@@ -1643,6 +1735,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     _autosave_stats()
     _start_metrics()
-    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+    # Nginx is the only public entrypoint; never expose the admin HTTP port.
+    server = ThreadingHTTPServer(("127.0.0.1", WEB_PORT), Handler)
     print(f"Running on :{WEB_PORT}")
     server.serve_forever()

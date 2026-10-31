@@ -31,9 +31,17 @@ git clone https://github.com/dmitriyshock/shocknet-vpn.git /tmp/shocknet-vpn
 sudo bash /tmp/shocknet-vpn/setup.sh
 ```
 
-The script installs OS and Python dependencies into `/opt/vpnserver/venv`, downloads Xray, creates fresh Reality keys and an initial administrator profile, obtains a Let's Encrypt certificate, configures Nginx, and enables five services. It asks for secrets without echoing the bot token. Generated secrets are stored only in `/opt/vpnserver/.env` (`0600`).
+The script installs OS and Python dependencies into `/opt/vpnserver/venv`, downloads Xray, creates fresh Reality keys, a **random** administrator subscription token and an initial administrator profile, obtains a Let's Encrypt certificate, configures Nginx, initializes `/opt/vpnbot/users.json`, and enables five services. It asks for secrets without echoing the bot token. Generated secrets are stored in `/opt/vpnserver/.env` (`0600`).
 
 To update an existing installation, run the same command again. It preserves `.env` and Xray client configurations while updating application files and restarting services.
+
+**Existing installations with `STATIC_TOKEN=admin` or `STATIC_TOKEN=user1` must rotate the administrator credentials after updating.** They were publicly guessable in older versions. On the VPS, after taking a backup and arranging to re-import your own VPN subscription, run:
+
+```bash
+sudo /opt/vpnserver/venv/bin/python /opt/vpnserver/repo/scripts/rotate_admin.py --apply
+```
+
+This backs up `.env` and both Xray JSON files, replaces the administrator token **and UUID**, and restarts `xray`, `xray2`, `vpnbot`, and `subserver`. Existing administrator VPN connections will briefly disconnect and must import the newly printed subscription URL. Other user UUIDs are preserved. The script does not run automatically during updates.
 
 ## Operations
 
@@ -45,9 +53,32 @@ journalctl -u xray -f
 
 The web panel is available at `https://YOUR_DOMAIN`; the Telegram login-protected dashboard is at `/admin`. The bot issues access through its approval flow and updates both Xray instances automatically.
 
+The web service listens on `127.0.0.1:8008`; Nginx is the public entrypoint. Trial keys expire after seven days and a bot job revokes their Xray credentials every minute (as long as the bot runs). Users should not rely on subscription URLs as secure storage: anyone possessing a URL can import that profile until access is revoked.
+
+The displayed **3 TB** is an informational comparison against lifetime traffic counters, **not** a monthly quota and **not** an enforced limit. Enforcing traffic limits or billing cycles requires additional server-side logic.
+
+Optional download links (`HAPP_DOWNLOAD_*`, `CLASH_DOWNLOAD_*`) can be configured in `/opt/vpnserver/.env` with official HTTPS URLs; until then, the panel deliberately shows no dead download buttons. The network metrics interface is auto-detected from the default route, or can be overridden with `METRICS_IFACE`.
+
+The optional `turnproxy.service` unit is provided as an integration point for an existing binary and WireGuard installation. This installer does **not** install that separate component; the dashboard shows it as unavailable when not installed.
+
+Visitor GeoIP lookup is disabled by default to protect visitor privacy. To opt in, provide `GEOIP_HTTPS_ENDPOINT` as an HTTPS URL containing `{ip}` and returning `status/country/regionName/city/lat/lon/isp` fields (compatible with the old `ip-api.com` JSON structure). Visitor IP addresses will be transmitted to that service. Subscription paths and user-stats URLs are excluded from new Nginx access logs; the log monitor also redacts them when parsing old logs.
+
+## Offline tests
+
+The tests cover admin authentication, CSRF protection, subscriptions, basic HTTP routes, trial cleanup, secret rotation, Xray JSON generation, and log redaction. They do not contact Telegram or change a live VPS.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+For an additional check of both generated configs with the actual Xray executable, set `XRAY_TEST_BINARY=/path/to/xray` before the last command. This runs `xray run -test` without starting a tunnel. A full production test still requires a real domain, TLS certificate, firewall configuration and Telegram credentials.
+
 ## Security notes
 
 - Do not commit `/opt/vpnserver/.env`, `/opt/xray*/config.json`, bot user data, logs, or databases. `.gitignore` covers these files.
 - Back up `/opt/vpnserver/.env`, `/opt/xray/config.json`, `/opt/xray2/config.json`, and `/opt/vpnbot/users.json` securely before rebuilding a server.
+- The web admin session is HMAC-signed, expires after seven days, and uses an HttpOnly, Secure, SameSite=Strict cookie. The server must be accessed through HTTPS Nginx.
 - Rotate any credential that was ever present in a Git remote URL, configuration file, terminal history, or chat.
 - This project is intended for lawful use and is operated at the administrator's responsibility.

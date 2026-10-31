@@ -9,6 +9,7 @@ import hashlib
 import signal
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import quote
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
@@ -19,6 +20,7 @@ NGINX_LOGS = [
 VISITOR_LOG_DIR = Path("/var/log/visitors")
 DB_PATH = Path("/opt/log-monitor/geo_cache.db")
 STATE_FILE = Path("/opt/log-monitor/.state")
+GEOIP_HTTPS_ENDPOINT = os.getenv("GEOIP_HTTPS_ENDPOINT", "")
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 LOG_PATTERN = re.compile(
@@ -62,8 +64,12 @@ def get_geo(conn, ip):
     now = int(time.time())
     if row and (now - row[6]) < 604800:
         return {"country": row[0], "region": row[1], "city": row[2], "lat": row[3], "lon": row[4], "isp": row[5]}
+    # External geolocation transmits visitor IPs; opt-in and HTTPS only.
+    if not GEOIP_HTTPS_ENDPOINT.startswith("https://"):
+        return {"country": row[0], "region": row[1], "city": row[2], "lat": row[3], "lon": row[4], "isp": row[5]} if row else None
     try:
-        req = Request(f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,lat,lon,isp", headers={"User-Agent": "log-monitor/1.0"})
+        api_url = GEOIP_HTTPS_ENDPOINT.replace("{ip}", quote(ip, safe=""))
+        req = Request(api_url, headers={"User-Agent": "log-monitor/1.0"})
         with urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
         if data.get("status") == "success":
@@ -148,6 +154,19 @@ def is_bot(ua_string, ip):
         if pattern in ua_string:
             return True
     return False
+
+def sanitize_path(page):
+    """Never persist subscription bearer tokens or URL query credentials."""
+    page = page.split("?", 1)[0]
+    for prefix in ("/sub/clash/", "/sub/", "/api/user-stats/"):
+        if page.startswith(prefix):
+            return prefix + "[redacted]"
+    return page
+
+def sanitize_referrer(referrer):
+    if "/sub/" in referrer or "/api/user-stats/" in referrer:
+        return "[redacted]"
+    return referrer.split("?", 1)[0]
 
 
 def get_log_path(dt):
@@ -287,10 +306,10 @@ def process_line(line, geo_conn, state):
         "ip": ip,
         "datetime": dt,
         "method": m.group("method"),
-        "page": page,
+        "page": sanitize_path(page),
         "status": m.group("status"),
         "size": m.group("size"),
-        "referrer": m.group("referrer"),
+        "referrer": sanitize_referrer(m.group("referrer")),
         "ua": ua_string,
         "device_info": device_info,
         "geo": geo,

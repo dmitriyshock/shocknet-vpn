@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, subprocess, uuid, base64, secrets, time
+import json, os, subprocess, uuid, base64, secrets, time, tempfile, fcntl
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,13 +27,32 @@ XRAY = {
 # ── storage ──────────────────────────────────────────────────────────────────
 
 def load_db() -> dict:
-    db = json.loads(USERS_FILE.read_text())
-    if "trial_keys" not in db:
-        db["trial_keys"] = {}
+    try:
+        db = json.loads(USERS_FILE.read_text())
+    except FileNotFoundError:
+        db = {"admin_id": 0, "users": {}, "trial_keys": {}}
+    db.setdefault("admin_id", 0)
+    db.setdefault("users", {})
+    db.setdefault("trial_keys", {})
     return db
 
+def write_json_atomic(path: Path, db: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic replace so readers never see partially written JSON.
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=".shocknet-", delete=False) as tmp:
+            tmp_name = tmp.name
+            os.fchmod(tmp.fileno(), 0o600)
+            json.dump(db, tmp, indent=2, ensure_ascii=False)
+        os.replace(tmp_name, path)
+    finally:
+        if tmp_name and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
 def save_db(db: dict):
-    USERS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False))
+    write_json_atomic(USERS_FILE, db)
 
 def get_admin_id() -> int:
     return load_db().get("admin_id", 0)
@@ -46,27 +65,33 @@ def set_admin_id(aid: int):
 
 XRAY_API    = "127.0.0.1:10085"
 STATS_FILE  = Path("/opt/vpnbot/stats_persistent.json")
+STATS_LOCK  = Path("/opt/vpnbot/stats_persistent.lock")
 
 def _snapshot_stats():
     """Save live xray counters to file before restart so they aren't lost."""
     try:
-        r = subprocess.run(
-            ["/opt/xray/xray", "api", "statsquery", f"--server={XRAY_API}"],
-            capture_output=True, text=True, timeout=3
-        )
-        live = {}
-        for item in json.loads(r.stdout).get("stat", []):
-            n, v = item["name"], int(item.get("value", 0))
-            if "user>>>" in n:
-                parts = n.split(">>>")
-                em, direction = parts[1], parts[3]
-                live.setdefault(em, {"uplink": 0, "downlink": 0})[direction] = v
-        saved = json.loads(STATS_FILE.read_text()) if STATS_FILE.exists() else {}
-        for em, vals in live.items():
-            saved.setdefault(em, {"uplink": 0, "downlink": 0})
-            saved[em]["uplink"]   += vals.get("uplink", 0)
-            saved[em]["downlink"] += vals.get("downlink", 0)
-        STATS_FILE.write_text(json.dumps(saved))
+        STATS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        with STATS_LOCK.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            live = {}
+            for binary, api in (("/opt/xray/xray", XRAY_API), ("/opt/xray2/xray", "127.0.0.1:10086")):
+                r = subprocess.run([binary, "api", "statsquery", f"--server={api}", "--reset"],
+                                   capture_output=True, text=True, timeout=3)
+                if r.returncode:
+                    continue
+                for item in json.loads(r.stdout).get("stat", []):
+                    n, v = item["name"], int(item.get("value", 0))
+                    if "user>>>" in n:
+                        parts = n.split(">>>")
+                        em, direction = parts[1], parts[3]
+                        entry = live.setdefault(em, {"uplink": 0, "downlink": 0})
+                        entry[direction] += v
+            saved = json.loads(STATS_FILE.read_text()) if STATS_FILE.exists() else {}
+            for em, vals in live.items():
+                saved.setdefault(em, {"uplink": 0, "downlink": 0})
+                saved[em]["uplink"]   += vals.get("uplink", 0)
+                saved[em]["downlink"] += vals.get("downlink", 0)
+            write_json_atomic(STATS_FILE, saved)
     except Exception:
         pass
 
@@ -85,7 +110,7 @@ def _cfg_add(cfg_path: Path, uid: str, email: str) -> bool:
             clients.append({"id": uid, "email": email})
         changed = True
     if changed:
-        cfg_path.write_text(json.dumps(cfg, indent=2))
+        write_json_atomic(cfg_path, cfg)
     return changed
 
 def _cfg_remove(cfg_path: Path, email: str) -> bool:
@@ -102,26 +127,27 @@ def _cfg_remove(cfg_path: Path, email: str) -> bool:
         if len(inbound["settings"]["clients"]) != before:
             changed = True
     if changed:
-        cfg_path.write_text(json.dumps(cfg, indent=2))
+        write_json_atomic(cfg_path, cfg)
     return changed
 
 def xray_add(uid: str, email: str):
     c1 = _cfg_add(XRAY_CFG, uid, email)
     c2 = _cfg_add(XRAY2_CFG, uid, email)   # xray2 = профиль VK (8443) — обязательно!
-    if c1:
-        _snapshot_stats()
-        subprocess.run(["systemctl", "reload-or-restart", "xray"], check=False)
-    if c2:
-        subprocess.run(["systemctl", "reload-or-restart", "xray2"], check=False)
+    ok = True
+    _snapshot_stats()
+    # Retry a failed previous restart even if the JSON already contains the UUID.
+    ok &= subprocess.run(["systemctl", "restart", "xray"], check=False).returncode == 0
+    ok &= subprocess.run(["systemctl", "restart", "xray2"], check=False).returncode == 0
+    return ok
 
 def xray_remove(email: str):
     c1 = _cfg_remove(XRAY_CFG, email)
     c2 = _cfg_remove(XRAY2_CFG, email)
-    if c1:
-        _snapshot_stats()
-        subprocess.run(["systemctl", "reload-or-restart", "xray"], check=False)
-    if c2:
-        subprocess.run(["systemctl", "reload-or-restart", "xray2"], check=False)
+    ok = True
+    _snapshot_stats()
+    ok &= subprocess.run(["systemctl", "restart", "xray"], check=False).returncode == 0
+    ok &= subprocess.run(["systemctl", "restart", "xray2"], check=False).returncode == 0
+    return ok
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -145,16 +171,21 @@ def cleanup_expired_trials():
     changed = False
     for token, t in list(db["trial_keys"].items()):
         if t.get("expires_at", 0) < now:
-            xray_remove(t["email"])
+            if not xray_remove(t["email"]):
+                continue  # Retain for retry if a service restart failed.
             del db["trial_keys"][token]
             changed = True
     if changed:
         save_db(db)
 
+async def scheduled_trial_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    """Remove expired credentials even if the administrator never opens the menu."""
+    cleanup_expired_trials()
+
 
 # ── admin menu ────────────────────────────────────────────────────────────────
 
-STATIC_TOKEN = os.getenv("STATIC_TOKEN", "user1")
+STATIC_TOKEN = os.getenv("STATIC_TOKEN", "")
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
@@ -162,7 +193,7 @@ def admin_keyboard():
          InlineKeyboardButton("🔑 Тест ключи",      callback_data="menu:trial")],
         [InlineKeyboardButton("🎁 Создать тест ключ", callback_data="menu:new_trial"),
          InlineKeyboardButton("❌ Убрать подписку",  callback_data="menu:revoke")],
-        [InlineKeyboardButton("🔗 Мой конфиг (user1)", callback_data="menu:my_config")],
+        [InlineKeyboardButton("🔗 Мой конфиг", callback_data="menu:my_config")],
     ])
 
 async def send_admin_menu(target, ctx, text="👑 Меню администратора:"):
@@ -278,8 +309,10 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "created_at": now,
             "expires_at": exp,
         }
+        if not xray_add(user_uuid, email):
+            await query.edit_message_text("⚠️ Не удалось перезапустить Xray. Проверь журнал и попробуй позже.")
+            return
         save_db(db)
-        xray_add(user_uuid, email)
 
         url = sub_url(token)
         await query.edit_message_text(
@@ -310,7 +343,7 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "my_config":
         url = sub_url(STATIC_TOKEN)
         await query.edit_message_text(
-            f"🔗 *Твой конфиг (user1):*\n\n`{url}`",
+            f"🔗 *Твой конфиг:*\n\n`{url}`",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("« Назад", callback_data="menu:back")]]),
             parse_mode="Markdown")
@@ -337,7 +370,9 @@ async def cb_revoke_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("« Назад", callback_data="menu:back")]]))
         return
 
-    xray_remove(u.get("email", f"tg_{tuid}"))
+    if not xray_remove(u.get("email", f"tg_{tuid}")):
+        await query.edit_message_text("⚠️ Xray не перезапустился. Доступ пока не отозван, проверь сервер.")
+        return
     db["users"][tuid].update({"approved": False, "pending": False, "token": None, "uuid": None})
     save_db(db)
 
@@ -403,7 +438,9 @@ async def cb_trial_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("Ключ не найден.", show_alert=True)
         return
 
-    xray_remove(t["email"])
+    if not xray_remove(t["email"]):
+        await query.edit_message_text("⚠️ Не получилось отключить ключ на Xray. Повтори позже.")
+        return
     del db["trial_keys"][token]
     save_db(db)
 
@@ -469,10 +506,12 @@ async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     token     = gen_token()
     user_uuid = str(uuid.uuid4())
     email     = f"tg_{tuid}"
+    if not xray_add(user_uuid, email):
+        await query.edit_message_text("⚠️ Xray не перезапустился. Заявка осталась без одобрения.")
+        return
     db["users"][tuid].update({"approved": True, "pending": False,
                                "token": token, "uuid": user_uuid, "email": email})
     save_db(db)
-    xray_add(user_uuid, email)
 
     page_url = sub_url(token)
     await ctx.bot.send_message(
@@ -527,7 +566,9 @@ async def cmd_revoke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u or not u.get("approved"):
         await update.message.reply_text("Пользователь не найден.")
         return
-    xray_remove(u.get("email", f"tg_{tuid}"))
+    if not xray_remove(u.get("email", f"tg_{tuid}")):
+        await update.message.reply_text("Не удалось перезапустить Xray. Доступ пока не отозван.")
+        return
     db["users"][tuid].update({"approved": False, "pending": False, "token": None, "uuid": None})
     save_db(db)
     try:
@@ -552,6 +593,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_revoke_user, pattern="^revoke_u:"))
     app.add_handler(CallbackQueryHandler(cb_user_link,   pattern="^user_link:"))
     app.add_handler(CallbackQueryHandler(cb_trial_del,  pattern="^trial_del:"))
+    cleanup_expired_trials()
+    app.job_queue.run_repeating(scheduled_trial_cleanup, interval=60, first=60)
     print("VPN bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

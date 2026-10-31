@@ -75,6 +75,10 @@ if [[ "$UPDATE_ONLY" -eq 0 ]]; then
   read -r -p "Telegram bot username (without @): " BOT_USERNAME
   [[ -n "$SERVER_IP" && -n "$DOMAIN" && -n "$BOT_TOKEN" && -n "$ADMIN_USERNAME" && -n "$BOT_USERNAME" ]] || die "All fields are required"
   [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "Invalid domain"
+  [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Invalid Telegram bot token format"
+  [[ "$ADMIN_USERNAME" =~ ^[A-Za-z0-9_]{3,32}$ ]] || die "Invalid administrator username"
+  [[ "$BOT_USERNAME" =~ ^[A-Za-z0-9_]{5,32}$ ]] || die "Invalid bot username"
+  python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$SERVER_IP" || die "Invalid IPv4 address"
 
   keys=$(/opt/xray/xray x25519)
   XRAY_PRIVATE_KEY=$(awk '/Private/{print $3}' <<<"$keys")
@@ -82,6 +86,7 @@ if [[ "$UPDATE_ONLY" -eq 0 ]]; then
   [[ -n "$XRAY_PRIVATE_KEY" && -n "$XRAY_PUBLIC_KEY" ]] || die "Could not generate Reality keys"
   XRAY_SHORT_ID=$(openssl rand -hex 8)
   STATIC_UUID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  STATIC_TOKEN=$(openssl rand -hex 24)
   SESSION_SECRET=$(openssl rand -hex 32)
 
   cat > "$ENV_FILE" <<EOF
@@ -98,7 +103,7 @@ XRAY_PORT=4443
 XRAY_PORT_HAPP=2053
 STATIC_UUID=$STATIC_UUID
 STATIC_LABEL=Administrator
-STATIC_TOKEN=admin
+STATIC_TOKEN=$STATIC_TOKEN
 SESSION_SECRET=$SESSION_SECRET
 EOF
   chmod 600 "$ENV_FILE"
@@ -113,28 +118,45 @@ EOF
   chmod 600 /opt/xray/config.json /opt/xray2/config.json
 fi
 
+# A new installation must have a database before the Telegram bot starts.
+# Preserve existing users and keys during subsequent updates.
+if [[ ! -f /opt/vpnbot/users.json ]]; then
+  printf '{"admin_id":0,"users":{},"trial_keys":{}}\n' > /opt/vpnbot/users.json
+fi
+chmod 600 /opt/vpnbot/users.json
+
 # Read the preserved or newly created settings; never print this file.
 set -a; . "$ENV_FILE"; set +a
 info "Obtaining TLS certificate for $DOMAIN"
 cat > /etc/nginx/sites-available/shocknet <<EOF
-server { listen 80; server_name $DOMAIN www.$DOMAIN; location / { return 200 "ShockNet certificate setup\\n"; } }
+server { listen 80; server_name $DOMAIN; location / { return 200 "ShockNet certificate setup"; } }
 EOF
 ln -sfn /etc/nginx/sites-available/shocknet /etc/nginx/sites-enabled/shocknet
 rm -f /etc/nginx/sites-enabled/default
-nginx -t && systemctl reload nginx
+nginx -t && systemctl enable --now nginx
 if [[ ! -d "/etc/letsencrypt/live/$DOMAIN" ]]; then
   certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@$DOMAIN" --redirect
 fi
 cat > /etc/nginx/sites-available/shocknet <<EOF
-server { listen 80; server_name $DOMAIN www.$DOMAIN; return 301 https://\\$host\\$request_uri; }
-server { listen 443 ssl http2; server_name $DOMAIN www.$DOMAIN;
+server { listen 80; server_name $DOMAIN; return 301 https://\$host\$request_uri; }
+server { listen 443 ssl http2; server_name $DOMAIN;
   ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem; ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-  location /vless { proxy_pass http://127.0.0.1:8880; proxy_http_version 1.1; proxy_set_header Upgrade \\$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \\$host; proxy_read_timeout 300s; }
-  location / { proxy_pass http://127.0.0.1:8008; proxy_set_header Host \\$host; proxy_set_header X-Real-IP \\$remote_addr; proxy_set_header X-Forwarded-Proto \\$scheme; }
+  add_header Strict-Transport-Security "max-age=31536000" always;
+  location /vless { access_log off; proxy_pass http://127.0.0.1:8880; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; proxy_read_timeout 300s; }
+  location ^~ /sub/ { access_log off; proxy_pass http://127.0.0.1:8008; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-Proto \$scheme; }
+  location ^~ /api/user-stats/ { access_log off; proxy_pass http://127.0.0.1:8008; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-Proto \$scheme; }
+  location / { proxy_pass http://127.0.0.1:8008; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-Proto \$scheme; }
 }
 EOF
-nginx -t && systemctl reload nginx
+nginx -t && systemctl reload-or-restart nginx
+
+if [[ "${STATIC_TOKEN:-}" == "admin" || "${STATIC_TOKEN:-}" == "user1" ]]; then
+  echo "WARNING: Legacy administrator subscription token detected. Run /opt/vpnserver/venv/bin/python /opt/vpnserver/repo/scripts/rotate_admin.py --apply (this disconnects admin clients)." >&2
+fi
 
 systemctl daemon-reload
-for service in xray xray2 vpnbot subserver log-monitor; do systemctl enable --now "$service"; done
+for service in xray xray2 vpnbot subserver log-monitor; do
+  systemctl enable "$service"
+  systemctl restart "$service"   # Also load updated code on repeat installs.
+done
 info "Done. Web panel: https://$DOMAIN  Admin: https://$DOMAIN/admin"
