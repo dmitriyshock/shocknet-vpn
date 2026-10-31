@@ -59,6 +59,28 @@ Optional download links (`HAPP_DOWNLOAD_*`, `CLASH_DOWNLOAD_*`) can be configure
 
 The optional `turnproxy.service` unit is provided as an integration point for an existing binary and WireGuard installation. This installer does **not** install that separate component; the dashboard shows it as unavailable when not installed.
 
+### Дополнительные Microsoft Reality-профили для тестов
+
+Если на действующем VPS уже работают Google (`4443`), Cloudflare (`2053`) и другие Reality-профили, их можно **сохранить** и добавить два независимых Microsoft-подключения:
+
+| Имя inbound | TCP-порт | Режим |
+| --- | --- | --- |
+| `vless-microsoft-8450` | 8450 | VLESS + Reality + Vision |
+| `vless-microsoft-mobile-8451` | 8451 | VLESS + Reality без Vision |
+
+Скрипт переносит клиентов и Reality-ключи из существующих профилей `4443` и `2053` только на новые порты. Ни один существующий inbound не удаляется. На сервере:
+
+```bash
+git -C /opt/vpnserver/repo pull --ff-only
+python3 /opt/vpnserver/repo/scripts/add_microsoft_test_profiles.py
+# Проверив вывод сухого прогона и сохранив снапшот VPS:
+python3 /opt/vpnserver/repo/scripts/add_microsoft_test_profiles.py --apply
+```
+
+При `--apply` скрипт делает резервную копию Xray-конфигурации, проверяет свободные порты и новую конфигурацию настоящим Xray, а затем один раз перезапускает `xray.service`. **Активные сессии на мгновение прервутся.** При ошибке запуска конфигурация откатывается. Проверь также доступность TCP-портов 8450/8451 в firewall VPS и у провайдера: скрипт не открывает их автоматически.
+
+Для ручного теста можно клонировать уже работающие VLESS-профили на клиенте: профиль `4443` → порт `8450`, SNI `www.microsoft.com`; профиль `2053` → порт `8451`, SNI `www.microsoft.com`. Остальные параметры, включая публичный Reality-ключ и short ID, остаются как в соответствующем исходном профиле. Новые тестовые порты пока не публикуются автоматически во всех подписках.
+
 Visitor GeoIP lookup is disabled by default to protect visitor privacy. To opt in, provide `GEOIP_HTTPS_ENDPOINT` as an HTTPS URL containing `{ip}` and returning `status/country/regionName/city/lat/lon/isp` fields (compatible with the old `ip-api.com` JSON structure). Visitor IP addresses will be transmitted to that service. Subscription paths and user-stats URLs are excluded from new Nginx access logs; the log monitor also redacts them when parsing old logs.
 
 ## Offline tests
