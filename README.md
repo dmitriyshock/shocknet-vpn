@@ -81,6 +81,12 @@ python3 /opt/vpnserver/repo/scripts/add_microsoft_test_profiles.py --apply
 
 Для ручного теста можно клонировать уже работающие VLESS-профили на клиенте: профиль `4443` → порт `8450`, SNI `www.microsoft.com`; профиль `2053` → порт `8451`, SNI `www.microsoft.com`. Остальные параметры, включая публичный Reality-ключ и short ID, остаются как в соответствующем исходном профиле. Новые тестовые порты пока не публикуются автоматически во всех подписках.
 
+### Исправление сертификата `shocknet.ru` при TLS-маршрутизации
+
+Для VPS с отдельным Nginx `stream` на порту `443` и локальным HTTPS `127.0.0.1:9443` есть **необязательный** скрипт `scripts/fix_shocknet_ru_tls.py`. Используйте его только если прямое TLS-подключение к `9443` с SNI `shocknet.ru` проверяет сертификат успешно, а подключение через публичный `443` получает чужой сертификат. Скрипт переносит только HTTPS-виртуальный хост `shocknet.ru` на отдельный локальный порт `9444` и добавляет для него отдельный маршрут в `stream`. Маршрут Reality для `ok.ru` и остальные службы не меняются.
+
+Скрипт по умолчанию делает только сухую проверку. При `--apply` проверяет свободный порт, создаёт резервные копии двух конфигураций Nginx, выполняет `nginx -t`, перезагружает Nginx и проверяет сертификаты обоих доменов через `443` с включённой проверкой TLS. При ошибке откатывает оба файла и повторно загружает исходную конфигурацию. Во время перезагрузки Nginx возможен короткий перерыв в HTTPS-подключениях. Скрипт намеренно не выпускает новые сертификаты и не изменяет файлы Let's Encrypt.
+
 Visitor GeoIP lookup is disabled by default to protect visitor privacy. To opt in, provide `GEOIP_HTTPS_ENDPOINT` as an HTTPS URL containing `{ip}` and returning `status/country/regionName/city/lat/lon/isp` fields (compatible with the old `ip-api.com` JSON structure). Visitor IP addresses will be transmitted to that service. Subscription paths and user-stats URLs are excluded from new Nginx access logs; the log monitor also redacts them when parsing old logs.
 
 ## Offline tests
